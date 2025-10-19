@@ -1,131 +1,136 @@
-import time
+import requests
 import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
-import random
-import os
+from bs4 import BeautifulSoup
+from typing import Generator, Any
+from datetime import datetime
 
-# -------------------------
-# Selenium setup
-# -------------------------
-options = Options()
-options.headless = False  # Set True for headless mode
-driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-wait = WebDriverWait(driver, 20)
+# ------------------------------
+# Generator to fetch job listings
+# ------------------------------
+def fetch_job(*, page: int, max_pages: int = 5) -> Generator[Any, None, None]:
+    while True:
+        if page > max_pages:
+            break
+        
+        print("Fetching page:", page)
+        url = f"https://huntinglebanese.com/en/careers/jobs/list?page={page}"
+        response = requests.get(url)
+        if response.status_code != 200:
+            break
+        
+        yield response.content
+        page += 1
 
-BASE_URL = "https://huntinglebanese.com"
-csv_file = "huntinglebanese_jobs.csv"
 
-# Loop through pages 2 to 12
-for page_num in range(3, 13):
-    print(f"Processing page {page_num}...")
-    page_url = BASE_URL + f"/en/careers/jobs/search-form-home?keyword=&country=&page={page_num}"
-    driver.get(page_url)
-    time.sleep(5)  # Wait for initial page load
+# ------------------------------
+# Function to fetch details for each job
+# ------------------------------
+def fetch_details(link: str) -> dict:
+    local_response = requests.get(link)
+    if local_response.status_code != 200:
+        return {
+            "description": None,
+            "category": None,
+            "employment_type": None,
+            "job_type": None,
+            "date_posted": None,
+            "salary": None
+        }
 
-    # Scroll to load all job links
-    for _ in range(5):
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(random.uniform(2, 4))
+    soup = BeautifulSoup(local_response.content, "html.parser")
 
-    # Wait for job links to appear
-    try:
-        wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a[href*='/en/careers/jobs/show/']")))
-    except:
-        print(f"No jobs found on page {page_num}")
-        continue
+    # Remove scripts/styles
+    for s in soup(["script", "style"]):
+        s.decompose()
 
-    # Collect all job URLs (remove duplicates)
-    job_links = driver.find_elements(By.CSS_SELECTOR, "a[href*='/en/careers/jobs/show/']")
-    job_urls = list(dict.fromkeys([link.get_attribute("href") for link in job_links]))
-    print(f"Found {len(job_urls)} jobs on page {page_num}")
+    # --------------------------
+    # Extract Job Details (label-value pairs)
+    # --------------------------
+    job_details = {}
+    for li in soup.select(".block-cv-content ul.tablecol li"):
+        label = li.select_one(".label-cv")
+        value = li.select_one(".value-cv")
+        if label and value:
+            key = label.get_text(strip=True).replace(":", "")
+            val = value.get_text(strip=True)
+            job_details[key] = val
 
-    page_jobs = []  # store jobs for current page
+    category = job_details.get("Job Category")
+    employment_type = job_details.get("Employment Type")
+    job_type = job_details.get("Job Duration")
+    salary = job_details.get("Monthly Salary in USD")  # may be None
 
-    # Visit each job page and scrape details
-    for idx, job_url in enumerate(job_urls, 1):
-        print(f"Scraping job {idx}/{len(job_urls)}: {job_url}")
-        driver.get(job_url)
-        time.sleep(2)  # wait 2 seconds for page to load
+    # --------------------------
+    # Extract Job Description
+    # --------------------------
+    description_block = None
+    for block in soup.select(".block-cv"):
+        title = block.select_one(".block-cv-title h2")
+        if title and "Job Description" in title.get_text(strip=True):
+            description_block = block
+            break
 
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-        time.sleep(1)
+    description = None
+    if description_block:
+        paragraphs = description_block.select(".block-cv-content p")
+        description = " ".join(p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True))
 
+    # --------------------------
+    # Extract Date Posted (first <li class="col-sm-6"> with Posted On)
+    # --------------------------
+    date_posted = None
+    posted_li = soup.select_one('li.col-sm-6 .labelnewjob')
+    if posted_li and "Posted On" in posted_li.get_text():
+        date_text = posted_li.parent.get_text(strip=True).replace("Posted On:", "")
         try:
-            title = driver.find_element(By.CSS_SELECTOR, "div.block-job-right h1").text.strip()
-        except:
-            title = "N/A"
+            date_obj = datetime.strptime(date_text, "%Y-%m-%d")
+            date_posted = date_obj.date().isoformat()
+        except ValueError:
+            date_posted = None
 
-        try:
-            company = driver.find_element(By.CSS_SELECTOR, "div.block-job-right h3").text.strip()
-        except:
-            company = "N/A"
+    return {
+        "description": description,
+        "category": category,
+        "employment_type": employment_type,
+        "job_type": job_type,
+        "date_posted": date_posted,
+        "salary": salary,
+    }
 
-        try:
-            date_posted = "N/A"
-            posted_elements = driver.find_elements(By.CSS_SELECTOR, "div.block-job-right li.col-sm-6")
-            for el in posted_elements:
-                label = el.find_element(By.CSS_SELECTOR, "span.labelnewjob").text.strip()
-                if "Posted On" in label:
-                    date_posted = el.text.replace(label, "").strip()
-                    break
-        except:
-            date_posted = "N/A"
+# ------------------------------
+# Main Scraping Logic
+# ------------------------------
+jobs = []
+for job in fetch_job(page=1, max_pages=11):
+    job = job.decode("utf-8")
+    soup = BeautifulSoup(job, "html.parser")
 
-        try:
-            description = ""
-            blocks = driver.find_elements(By.CSS_SELECTOR, "div.block-cv")
-            for block in blocks:
-                try:
-                    h2_text = block.find_element(By.CSS_SELECTOR, "div.block-cv-title > h2").text.strip()
-                    if "Job Description" in h2_text:
-                        description = block.find_element(By.CSS_SELECTOR, "div.block-cv-content").text.strip()
-                        break
-                except:
-                    continue
-            if not description:
-                description = "N/A"
-        except:
-            description = "N/A"
+    for li in soup.select("li"):
+        title_tag = li.select_one(".text .title a")
+        country_tag = li.select_one(".text .country a")
+        name_tag = li.select_one(".text .name a")
 
-        try:
-            salary = "N/A"
-            salary_blocks = driver.find_elements(By.CSS_SELECTOR, "div.block-cv")
-            for block in salary_blocks:
-                try:
-                    labels = block.find_elements(By.CSS_SELECTOR, "span.label-cv")
-                    values = block.find_elements(By.CSS_SELECTOR, "span.value-cv")
-                    for lbl, val in zip(labels, values):
-                        if "Monthly Salary" in lbl.text:
-                            salary = val.text.strip()
-                            break
-                except:
-                    continue
-        except:
-            salary = "N/A"
+        title = title_tag.get_text(strip=True) if title_tag else None
+        link = title_tag["href"] if title_tag and title_tag.has_attr("href") else None
+        country = country_tag.get_text(strip=True) if country_tag else None
+        name = name_tag.get_text(strip=True) if name_tag else None
 
-        page_jobs.append({
-            "Title": title,
-            "Company": company,
-            "Date Posted": date_posted,
-            "Salary": salary,
-            "Description": description,
-            "URL": job_url
-        })
+        if (title is None) or (link is None) or (str(country).lower().strip() != "lebanon") or (name is None):
+            continue
 
-        time.sleep(random.uniform(1, 2))  # polite delay
+        full_link = f"https://huntinglebanese.com/{link}"
+        details = fetch_details(full_link)
 
-    # Save current page jobs to CSV
-    df = pd.DataFrame(page_jobs)
-    if os.path.exists(csv_file):
-        df.to_csv(csv_file, mode='a', header=False, index=False)
-    else:
-        df.to_csv(csv_file, index=False)
+        jobs.append({
+            "title": title,
+            "link": full_link,
+            "country": country,
+            "name": name
+        } | details)
 
-driver.quit()
-print("Scraping complete!")
+# ------------------------------
+# Save results
+# ------------------------------
+df = pd.DataFrame(jobs)
+df.to_csv("hunting.csv", index=False)
+print("Saved")
